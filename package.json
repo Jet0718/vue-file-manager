@@ -1,0 +1,14 @@
+{
+  "name": "vue-file-manager",
+  "version": "1.0.0",
+  "description": "本機檔案管理系統（Vue 3 + Node.js，無外部相依）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/templates-check.js && node test/render-check.js && node test/interaction-check.js && node test/search-check.js && node test/multiselect-check.js && node test/rename-check.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

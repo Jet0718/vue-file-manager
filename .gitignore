@@ -1,0 +1,16 @@
+# 相依套件（測試用）
+node_modules/
+
+# 使用者資料（喜好資料夾等，勿上傳）
+data/
+
+# 執行時產生的檔案
+server.log
+.server.pid
+
+# 系統／編輯器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
