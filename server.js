@@ -10,6 +10,8 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+const zlib = require('zlib');
 const { spawn } = require('child_process');
 const { URL } = require('url');
 
@@ -368,14 +370,563 @@ async function uniqueDest(dir, name) {
   return dest;
 }
 
-/** 備份專用檔名：name_YYYYMMDD_HHmmss.ext */
-function backupName(name) {
-  const ext = path.extname(name);
-  const base = path.basename(name, ext);
-  const d = new Date();
+/* ---------------- 備份（封存標記 A 過濾 ＋ 全備份／差異備份） ---------------- */
+
+const BAK_DIR = '.bak';                   // 備份壓縮檔存放資料夾（位於目前資料夾下）
+const HISTORY_NAME = '.backup-history.json'; // 備份歷程記錄文件（位於目前資料夾下）
+const PS_EXE = 'powershell.exe';          // 查詢 Windows 封存標記用
+
+/** 備份 zip 命名用的年月日時分秒：YYYYMMDDHHmmss */
+function backupStamp(d = new Date()) {
   const pad = (n) => String(n).padStart(2, '0');
-  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  return `${base}_${stamp}${ext}`;
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+/** 執行 Windows 指令並取得 stdout（回傳原始 Buffer，由呼叫端決定編碼） */
+function runWin(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { windowsHide: true });
+    const chunks = [];
+    let err = '';
+    child.stdout.on('data', (c) => { chunks.push(c); });
+    child.stderr.on('data', (c) => { err += c; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`${cmd} 退出碼 ${code}：${err.trim()}`));
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
+/**
+ * 以 PowerShell 批次查詢 Windows 檔案的封存標記（A）。
+ * 回傳 Map：Windows 絕對路徑（小寫、反斜線）→ 是否有 A。
+ * 路徑以 UTF-8 輸出，避免中文檔名在傳統 attrib 輸出下變亂碼。
+ */
+async function queryWinArchiveFlags(winPaths) {
+  const flags = new Map();
+  const CHUNK = 80; // 控制單次命令列長度
+  for (let i = 0; i < winPaths.length; i += CHUNK) {
+    const chunk = winPaths.slice(i, i + CHUNK);
+    const lit = chunk.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
+    const script =
+      '$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;' +
+      `Get-Item -LiteralPath ${lit} -ErrorAction SilentlyContinue |` +
+      "ForEach-Object { $_.FullName + '|' + $_.Attributes }";
+    const out = await runWin(PS_EXE, ['-NoProfile', '-Command', script]);
+    for (const line of out.toString('utf8').split(/\r?\n/)) {
+      const idx = line.lastIndexOf('|');
+      if (idx <= 0) continue;
+      const full = line.slice(0, idx).trim();
+      const attrs = line.slice(idx + 1).trim();
+      flags.set(full.toLowerCase().replace(/\//g, '\\'), attrs.includes('Archive'));
+    }
+  }
+  return flags;
+}
+
+/**
+ * 過濾出具有封存標記（A）的檔案。
+ * 非 Windows 磁碟（如 /home、/tmp 等 Linux 檔案系統）沒有 Windows 屬性，視為皆有標記。
+ */
+async function filterArchiveFlagged(files) {
+  const winFiles = [];
+  const others = [];
+  for (const f of files) {
+    const win = toWindowsPath(f.abs);
+    if (win) winFiles.push({ f, win });
+    else others.push(f);
+  }
+  const marked = others.slice();
+  if (winFiles.length) {
+    let flags = new Map();
+    try { flags = await queryWinArchiveFlags(winFiles.map((x) => x.win)); }
+    catch { /* 查詢失敗時全部視為有標記，避免漏備份 */ }
+    for (const { f, win } of winFiles) {
+      const v = flags.get(win.toLowerCase().replace(/\//g, '\\'));
+      if (v === undefined || v) marked.push(f); // 查不到結果時保守視為有標記
+    }
+  }
+  return marked;
+}
+
+/**
+ * 收集選取項目下的所有檔案（子資料夾遞迴），回傳 [{ rel, abs, size, mtime }]。
+ * rel 為相對「目前資料夾」的路徑（zip 內條目名）；自動略過 .bak 資料夾與備份歷程文件。
+ */
+async function collectBackupFiles(scopeDir, paths) {
+  const seen = new Set();
+  const out = [];
+  const visit = async (abs, rel) => {
+    let st;
+    try { st = await fsp.stat(abs); } catch { return; }
+    if (st.isDirectory()) {
+      let entries;
+      try { entries = await fsp.readdir(abs, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const lower = e.name.toLowerCase();
+        if (lower === BAK_DIR.toLowerCase() || e.name === HISTORY_NAME) continue;
+        await visit(path.join(abs, e.name), rel ? `${rel}/${e.name}` : e.name);
+      }
+    } else if (!seen.has(abs)) {
+      seen.add(abs);
+      out.push({ rel, abs, size: st.size, mtime: st.mtimeMs });
+    }
+  };
+  for (const p of paths) {
+    let abs;
+    try {
+      // 相對路徑以「目前資料夾」為基準解析（前端一律送絕對路徑）
+      abs = path.isAbsolute(p) ? resolvePath(p) : path.resolve(scopeDir, p);
+    } catch { continue; }
+    if (!fs.existsSync(abs) || abs === scopeDir) continue;
+    const base = path.basename(abs);
+    if (base.toLowerCase() === BAK_DIR.toLowerCase() || base === HISTORY_NAME) continue;
+    await visit(abs, base);
+  }
+  return out;
+}
+
+/** 避免 zip 檔名衝突：同秒同前綴時在檔名後加 -1、-2… */
+function uniqueZipName(bakDir, base) {
+  let name = base;
+  let i = 1;
+  while (fs.existsSync(path.join(bakDir, name))) {
+    name = `${base.slice(0, -4)}-${i}${base.slice(-4)}`;
+    i++;
+  }
+  return name;
+}
+
+/** 讀取備份歷程記錄（不存在或格式錯誤回傳 null） */
+function loadBackupHistory(scopeDir) {
+  try {
+    const h = JSON.parse(fs.readFileSync(path.join(scopeDir, HISTORY_NAME), 'utf8'));
+    if (h && typeof h === 'object' && h.files && typeof h.files === 'object') return h;
+  } catch { /* 無歷程 */ }
+  return null;
+}
+
+/** 寫入備份歷程記錄（先寫暫存檔再更名，避免中斷造成半份檔案） */
+function saveBackupHistory(scopeDir, hist) {
+  const file = path.join(scopeDir, HISTORY_NAME);
+  fs.writeFileSync(file + '.tmp', JSON.stringify(hist, null, 2));
+  fs.renameSync(file + '.tmp', file);
+}
+
+/** 串流計算檔案 sha256（差異比對用） */
+function sha256File(p) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(p);
+    s.on('data', (d) => h.update(d));
+    s.on('error', reject);
+    s.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
+/** 批次清除 Windows 檔案的封存標記（A），回傳嘗試清除的數量 */
+async function clearWinArchiveFlags(winPaths) {
+  const CHUNK = 80;
+  let cleared = 0;
+  for (let i = 0; i < winPaths.length; i += CHUNK) {
+    const chunk = winPaths.slice(i, i + CHUNK);
+    const lit = chunk.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
+    const script =
+      `Get-Item -LiteralPath ${lit} -ErrorAction SilentlyContinue |` +
+      'ForEach-Object { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::Archive) }';
+    await runWin(PS_EXE, ['-NoProfile', '-Command', script]);
+    cleared += chunk.length;
+  }
+  return cleared;
+}
+
+/* ---------------- 壓縮檔（ZIP/TAR/RAR/7Z）預覽與還原 ---------------- */
+
+/** 路徑穿越防護：壓縮檔條目相對路徑 → 安全目標路徑（拒絕 .. 與絕對路徑） */
+function safeArchivePath(destDir, rel) {
+  const norm = String(rel).replace(/\\/g, '/');
+  const parts = norm.split('/').filter((s) => s && s !== '.');
+  if (parts.some((s) => s === '..') || /^[a-zA-Z]:/.test(norm) || norm.startsWith('/')) {
+    throw new Error(`不安全的壓縮檔條目：${rel}`);
+  }
+  const full = path.resolve(destDir, ...parts);
+  if (full !== path.resolve(destDir) && !full.startsWith(path.resolve(destDir) + path.sep)) {
+    throw new Error(`不安全的壓縮檔條目：${rel}`);
+  }
+  return full;
+}
+
+/** 解碼 zip 條目名稱：優先 UTF-8，其次 Big5（傳統 Windows 壓縮工具），最後 latin1 */
+function decodeZipName(bytes, flag) {
+  if (flag & 0x800) return bytes.toString('utf8');
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch {
+    try { return new TextDecoder('big5').decode(bytes); }
+    catch { return bytes.toString('latin1'); }
+  }
+}
+
+/** 解碼外部工具（bsdtar 等）輸出：可能為 cp950（Big5）或 UTF-8 */
+function decodeExternalName(bytes) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch {
+    try { return new TextDecoder('big5').decode(bytes); }
+    catch { return bytes.toString('latin1'); }
+  }
+}
+
+/** 讀取 zip 中央目錄（僅讀取必要區段，記憶體友善） */
+async function readZipCentral(fd, size) {
+  const tail = Math.min(size, 65557);
+  const buf = Buffer.alloc(tail);
+  await fd.read(buf, 0, tail, size - tail);
+  let eocd = -1;
+  for (let i = tail - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('ZIP 格式錯誤（找不到目錄）');
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOff = buf.readUInt32LE(eocd + 16);
+  const count = buf.readUInt16LE(eocd + 10);
+  const cd = Buffer.alloc(cdSize);
+  await fd.read(cd, 0, cdSize, cdOff);
+  return { cd, count };
+}
+
+function parseCentral(cd, count) {
+  const entries = [];
+  let off = 0;
+  for (let i = 0; i < count && off + 46 <= cd.length; i++) {
+    if (cd.readUInt32LE(off) !== 0x02014b50) break;
+    const flag = cd.readUInt16LE(off + 8);
+    const method = cd.readUInt16LE(off + 10);
+    const crc = cd.readUInt32LE(off + 16);
+    const csize = cd.readUInt32LE(off + 20);
+    const usize = cd.readUInt32LE(off + 24);
+    const nameLen = cd.readUInt16LE(off + 28);
+    const extraLen = cd.readUInt16LE(off + 30);
+    const commentLen = cd.readUInt16LE(off + 32);
+    const localOff = cd.readUInt32LE(off + 42);
+    const name = decodeZipName(cd.subarray(off + 46, off + 46 + nameLen), flag);
+    entries.push({ name, method, crc, csize, usize, localOff });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+/** 讀取單一 zip 條目的解壓內容 */
+async function readZipEntryData(fd, entry) {
+  const head = Buffer.alloc(30);
+  await fd.read(head, 0, 30, entry.localOff);
+  if (head.readUInt32LE(0) !== 0x04034b50) throw new Error('ZIP 結構錯誤（local header）');
+  const nameLen = head.readUInt16LE(26);
+  const extraLen = head.readUInt16LE(28);
+  const dataStart = entry.localOff + 30 + nameLen + extraLen;
+  const comp = Buffer.alloc(entry.csize);
+  await fd.read(comp, 0, entry.csize, dataStart);
+  const raw = entry.method === 8 ? zlib.inflateRawSync(comp) : comp;
+  if (entry.crc && crc32(raw) !== entry.crc) throw new Error(`CRC 不符：${entry.name}`);
+  return raw;
+}
+
+/** 列出 zip 內容 */
+async function listZipEntries(zipPath) {
+  const fd = await fsp.open(zipPath, 'r');
+  try {
+    const size = (await fd.stat()).size;
+    const { cd, count } = await readZipCentral(fd, size);
+    return parseCentral(cd, count).map((e) => ({
+      name: e.name,
+      size: e.usize,
+      compressed: e.csize,
+      method: e.method === 8 ? 'deflate' : 'store',
+      isDir: /\/$/.test(e.name),
+    }));
+  } finally { await fd.close(); }
+}
+
+/** 還原 zip：逐條目解壓至 destDir（含路徑穿越防護與 CRC 驗證） */
+async function extractZip(zipPath, destDir, overwrite) {
+  const fd = await fsp.open(zipPath, 'r');
+  let restored = 0, skipped = 0;
+  const errors = [];
+  try {
+    const size = (await fd.stat()).size;
+    const { cd, count } = await readZipCentral(fd, size);
+    for (const e of parseCentral(cd, count)) {
+      if (/\/$/.test(e.name)) continue; // 目錄條目
+      try {
+        const dest = safeArchivePath(destDir, e.name);
+        if (!overwrite && fs.existsSync(dest)) { skipped++; continue; }
+        const data = await readZipEntryData(fd, e);
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.writeFile(dest, data);
+        restored++;
+      } catch (err) { errors.push(`${e.name}：${err.message}`); }
+    }
+  } finally { await fd.close(); }
+  return { restored, skipped, errors };
+}
+
+/** 循序走訪 tar（支援 GNU 長檔名），onEntry 回 false 可中止 */
+async function walkTar(fd, size, onEntry) {
+  let off = 0;
+  let pendingName = null;
+  const block = Buffer.alloc(512);
+  while (off + 512 <= size) {
+    await fd.read(block, 0, 512, off);
+    if (block.every((b) => b === 0)) break;
+    const name = block.toString('utf8', 0, 100).split('\0')[0];
+    const sizeStr = block.toString('utf8', 124, 136).replace(/[^0-7]/g, '');
+    const sz = parseInt(sizeStr, 8) || 0;
+    const type = String.fromCharCode(block[156] || 48);
+    const prefix = block.toString('utf8', 345, 500).split('\0')[0];
+    const dataOff = off + 512;
+    if (type === 'L') { // GNU 長檔名：資料區即真實檔名
+      const nameBuf = Buffer.alloc(sz);
+      await fd.read(nameBuf, 0, sz, dataOff);
+      pendingName = nameBuf.toString('utf8').split('\0')[0];
+      off += 512 + Math.ceil(sz / 512) * 512;
+      continue;
+    }
+    const full = pendingName || (prefix ? `${prefix}/${name}` : name);
+    pendingName = null;
+    const cont = await onEntry({ name: full, size: sz, type, dataOff, blockSize: Math.ceil(sz / 512) * 512 });
+    if (cont === false) break;
+    off = dataOff + Math.ceil(sz / 512) * 512;
+  }
+}
+
+/** 列出 tar 內容 */
+async function listTarEntries(tarPath) {
+  const fd = await fsp.open(tarPath, 'r');
+  const entries = [];
+  try {
+    const size = (await fd.stat()).size;
+    await walkTar(fd, size, (e) => { entries.push({ name: e.name, size: e.size, compressed: e.size, method: 'tar', isDir: e.type === '5' }); });
+  } finally { await fd.close(); }
+  return entries;
+}
+
+/** 還原 tar */
+async function extractTar(tarPath, destDir, overwrite) {
+  const fd = await fsp.open(tarPath, 'r');
+  let restored = 0, skipped = 0;
+  const errors = [];
+  try {
+    const size = (await fd.stat()).size;
+    await walkTar(fd, size, async (e) => {
+      try {
+        const dest = safeArchivePath(destDir, e.name);
+        if (e.type === '5') { await fsp.mkdir(dest, { recursive: true }); return; }
+        if (e.type !== '0' && e.type !== '') return; // 略過符號連結等特殊型別
+        if (!overwrite && fs.existsSync(dest)) { skipped++; return; }
+        const data = Buffer.alloc(e.size);
+        await fd.read(data, 0, e.size, e.dataOff);
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.writeFile(dest, data);
+        restored++;
+      } catch (err) { errors.push(`${e.name}：${err.message}`); }
+    });
+  } finally { await fd.close(); }
+  return { restored, skipped, errors };
+}
+
+/** 尋找可讀取 RAR/7Z 的外部工具：優先 7-Zip，否則 Windows tar.exe（bsdtar） */
+function findArchiveTool() {
+  const fixed = ['/mnt/c/Program Files/7-Zip/7z.exe', 'C:\\Program Files\\7-Zip\\7z.exe'];
+  for (const p of fixed) if (fs.existsSync(p)) return { cmd: p, kind: '7z' };
+  const names = ['7z', '7zz', 'tar.exe', 'tar'];
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const n of names) {
+    for (const dir of pathDirs) {
+      try {
+        const p = path.join(dir, n);
+        if (fs.existsSync(p)) return { cmd: p, kind: n.startsWith('tar') ? 'tar' : '7z' };
+      } catch { /* 忽略無效路徑 */ }
+    }
+  }
+  return null;
+}
+
+/** 以外部工具列出 RAR/7Z 內容 */
+async function listExternalArchive(p, ext) {
+  const tool = findArchiveTool();
+  if (!tool) throw new Error('系統缺少可讀取此格式的工具（需 7-Zip 或 Windows tar.exe）');
+  const win = toWindowsPath(p) || p;
+  if (tool.kind === '7z') {
+    const out = (await runWin(tool.cmd, ['l', '-slt', win])).toString('utf8');
+    const entries = [];
+    let cur = null;
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^Path = (.*)$/);
+      if (m) { cur = { name: m[1], size: 0, compressed: 0, method: ext.toUpperCase(), isDir: /\/$/.test(m[1]) }; entries.push(cur); continue; }
+      const ms = line.match(/^Size = (\d+)$/);
+      if (ms && cur) cur.size = Number(ms[1]);
+      const mc = line.match(/^Packed Size = (\d+)$/);
+      if (mc && cur) cur.compressed = Number(mc[1]);
+    }
+    if (!entries.length) throw new Error('7-Zip 無法列出內容');
+    return entries;
+  }
+  const out = await runWin(tool.cmd, ['-tf', win]);
+  const entries = [];
+  for (const line of out.toString('utf8').split(/\r?\n/)) {
+    const name = line.replace(/\/$/, '');
+    if (!name.trim() || name === win) continue;
+    entries.push({ name: decodeExternalName(Buffer.from(line, 'utf8')), size: 0, compressed: 0, method: ext.toUpperCase(), isDir: line.endsWith('/') });
+  }
+  if (!entries.length) throw new Error('無法列出壓縮檔內容');
+  return entries;
+}
+
+/** 遞迴走訪資料夾，回傳 [{ rel, abs, isDir }] */
+async function walkDirTree(root) {
+  const out = [];
+  const visit = async (abs, rel) => {
+    let st;
+    try { st = await fsp.stat(abs); } catch { return; }
+    if (st.isDirectory()) {
+      out.push({ rel, abs, isDir: true });
+      let entries;
+      try { entries = await fsp.readdir(abs, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) await visit(path.join(abs, e.name), rel ? `${rel}/${e.name}` : e.name);
+    } else {
+      out.push({ rel, abs, isDir: false });
+    }
+  };
+  await visit(root, '');
+  return out;
+}
+
+/** 以外部工具還原 RAR/7Z：先解壓至暫存夾再依規則搬移（覆蓋／跳過、路徑防護） */
+async function extractExternalArchive(p, ext, destDir, overwrite) {
+  const tool = findArchiveTool();
+  if (!tool) throw new Error('系統缺少可解壓此格式的工具（需 7-Zip 或 Windows tar.exe）');
+  const win = toWindowsPath(p) || p;
+  const tmp = path.join(destDir, `.restore-tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+  await fsp.mkdir(tmp, { recursive: true });
+  let restored = 0, skipped = 0;
+  const errors = [];
+  try {
+    const winTmp = toWindowsPath(tmp) || tmp;
+    if (tool.kind === '7z') await runWin(tool.cmd, ['x', '-y', `-o${winTmp}`, win]);
+    else await runWin(tool.cmd, ['-xf', win, '-C', winTmp]);
+    for (const { rel, abs, isDir } of await walkDirTree(tmp)) {
+      if (!rel) continue;
+      try {
+        const dest = safeArchivePath(destDir, rel);
+        if (isDir) { await fsp.mkdir(dest, { recursive: true }); continue; }
+        if (!overwrite && fs.existsSync(dest)) { skipped++; continue; }
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.copyFile(abs, dest);
+        restored++;
+      } catch (err) { errors.push(`${rel}：${err.message}`); }
+    }
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true });
+  }
+  return { restored, skipped, errors };
+}
+
+/** 依副檔名列出壓縮檔內容 */
+async function listArchiveEntries(p) {
+  const ext = path.extname(p).toLowerCase();
+  if (ext === '.zip') return listZipEntries(p);
+  if (ext === '.tar') return listTarEntries(p);
+  if (ext === '.rar' || ext === '.7z') return listExternalArchive(p, ext);
+  throw new Error('僅支援 ZIP / RAR / 7Z / TAR 壓縮檔');
+}
+
+/** 依副檔名還原壓縮檔至 destDir */
+async function extractArchive(p, destDir, overwrite) {
+  const ext = path.extname(p).toLowerCase();
+  if (ext === '.zip') return extractZip(p, destDir, overwrite);
+  if (ext === '.tar') return extractTar(p, destDir, overwrite);
+  if (ext === '.rar' || ext === '.7z') return extractExternalArchive(p, ext, destDir, overwrite);
+  throw new Error('僅支援 ZIP / RAR / 7Z / TAR 壓縮檔');
+}
+
+/** 還原預設目標：壓縮檔若位於 .bak 資料夾內，則還原至其上一層（原始備份目錄） */
+function defaultRestoreDir(zipPath) {
+  const parent = path.dirname(zipPath);
+  return path.basename(parent).toLowerCase() === BAK_DIR.toLowerCase()
+    ? path.dirname(parent)
+    : parent;
+}
+
+/* ---------------- 重整：找尋內容重複的檔案（去重） ---------------- */
+
+const DEDUP_MAX_SCAN = 50000; // 掃描節點上限，避免大型目錄卡死
+
+/**
+ * 掃描目前資料夾與子目錄，找出內容相同的重複檔案。
+ * 先依檔案長度（大小）分組，僅對同大小檔案再比對 sha256 內容雜湊。
+ * 每組預設勾選「檔名較長者」：保留檔名最短的檔案，其餘標記 defaultChecked。
+ */
+async function scanDuplicates(rootDir) {
+  const files = []; // { path, name, size, mtime }
+  let scanned = 0;
+  const visit = async (abs) => {
+    if (scanned >= DEDUP_MAX_SCAN) return;
+    let entries;
+    try { entries = await fsp.readdir(abs, { withFileTypes: true }); } catch { return; }
+    scanned += entries.length;
+    for (const e of entries) {
+      if (scanned >= DEDUP_MAX_SCAN) return;
+      if (e.name.startsWith('.')) continue;             // 略過隱藏檔／.bak／歷程文件
+      if (e.isDirectory()) {
+        if (RECENT_SKIP.has(e.name)) continue;          // 略過 node_modules 等雜訊目錄
+        await visit(path.join(abs, e.name));
+      } else {
+        const full = path.join(abs, e.name);
+        let st;
+        try { st = await fsp.stat(full); } catch { continue; }
+        files.push({ path: full, name: e.name, size: st.size, mtime: st.mtimeMs });
+      }
+    }
+  };
+  await visit(rootDir);
+
+  // 第一步：依檔案長度（大小）分組，只保留大小重複的
+  const bySize = new Map();
+  for (const f of files) {
+    if (!bySize.has(f.size)) bySize.set(f.size, []);
+    bySize.get(f.size).push(f);
+  }
+
+  // 第二步：同大小的檔案再比對 sha256 內容雜湊
+  const groups = [];
+  for (const [size, list] of bySize) {
+    if (list.length < 2) continue;
+    const byHash = new Map();
+    for (const f of list) {
+      let h;
+      try { h = await sha256File(f.path); } catch { continue; }
+      if (!byHash.has(h)) byHash.set(h, []);
+      byHash.get(h).push(f);
+    }
+    for (const [hash, fl] of byHash) {
+      if (fl.length < 2) continue;
+      // 檔名最短者保留；其餘（檔名較長者）預設勾選為刪除對象
+      fl.sort((a, b) => (a.name.length - b.name.length) || a.name.localeCompare(b.name, 'zh-Hant'));
+      const keep = fl[0];
+      groups.push({
+        size,
+        hash,
+        files: fl.map((f) => ({
+          path: f.path,
+          name: f.name,
+          size: f.size,
+          mtime: f.mtime,
+          defaultChecked: f !== keep,
+        })),
+      });
+    }
+  }
+  groups.sort((a, b) => b.size - a.size); // 大檔案優先呈現
+  return groups;
 }
 
 /** 遞迴複製資料夾 */
@@ -429,8 +980,11 @@ function collectZipEntries(p, prefix, out) {
   }
 }
 
-/** 建立 ZIP（store 模式）Buffer */
-function buildZip(entries) {
+/** 建立 ZIP（deflate 壓縮，選用 withHashes 時一併回傳各條目 sha256）
+ *  回傳 Buffer；opts.withHashes 為 true 時回傳 { buf, hashes } */
+function buildZip(entries, opts = {}) {
+  const withHashes = !!opts.withHashes;
+  const hashes = new Map();
   const chunks = [];
   const central = [];
   let offset = 0;
@@ -440,29 +994,36 @@ function buildZip(entries) {
     const nameBytes = enc.encode(e.zipName);
     const data = e.fsPath ? fs.readFileSync(e.fsPath) : Buffer.alloc(0);
     const crc = crc32(data);
+    let method = 0;
+    let payload = data;
+    if (data.length) {
+      const deflated = zlib.deflateRawSync(data);
+      if (deflated.length < data.length) { method = 8; payload = deflated; } // 壓縮無益時改純儲存
+    }
+    if (withHashes && e.fsPath) hashes.set(e.zipName, crypto.createHash('sha256').update(data).digest('hex'));
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);       // version needed
     local.writeUInt16LE(0x0800, 6);   // flag：UTF-8 檔名
-    local.writeUInt16LE(0, 8);        // method：store
+    local.writeUInt16LE(method, 8);   // method：8=deflate，0=store
     local.writeUInt16LE(dt.time, 10);
     local.writeUInt16LE(dt.date, 12);
     local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
+    local.writeUInt32LE(payload.length, 18);  // 壓縮後大小
+    local.writeUInt32LE(data.length, 22);     // 原始大小
     local.writeUInt16LE(nameBytes.length, 26);
     local.writeUInt16LE(0, 28);
-    chunks.push(local, nameBytes, data);
+    chunks.push(local, nameBytes, payload);
     const cd = Buffer.alloc(46);
     cd.writeUInt32LE(0x02014b50, 0);
     cd.writeUInt16LE(20, 4);
     cd.writeUInt16LE(20, 6);
     cd.writeUInt16LE(0x0800, 8);
-    cd.writeUInt16LE(0, 10);
+    cd.writeUInt16LE(method, 10);
     cd.writeUInt16LE(dt.time, 12);
     cd.writeUInt16LE(dt.date, 14);
     cd.writeUInt32LE(crc, 16);
-    cd.writeUInt32LE(data.length, 20);
+    cd.writeUInt32LE(payload.length, 20);
     cd.writeUInt32LE(data.length, 24);
     cd.writeUInt16LE(nameBytes.length, 28);
     cd.writeUInt16LE(0, 30);
@@ -472,7 +1033,7 @@ function buildZip(entries) {
     cd.writeUInt32LE(e.fsPath ? 0 : 0x10, 38); // external attrs（資料夾標記）
     cd.writeUInt32LE(offset, 42);
     central.push(cd, nameBytes);
-    offset += local.length + nameBytes.length + data.length;
+    offset += local.length + nameBytes.length + payload.length;
   }
   const cdStart = offset;
   const cdSize = central.reduce((s, c) => s + c.length, 0);
@@ -485,7 +1046,8 @@ function buildZip(entries) {
   eocd.writeUInt32LE(cdSize, 12);
   eocd.writeUInt32LE(cdStart, 16);
   eocd.writeUInt16LE(0, 20);
-  return Buffer.concat([...chunks, ...central, eocd]);
+  const buf = Buffer.concat([...chunks, ...central, eocd]);
+  return withHashes ? { buf, hashes } : buf;
 }
 
 /** 待下載的 ZIP 暫存（token → { at, file }），10 分鐘後清除 */
@@ -724,6 +1286,25 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          case '/api/archive': {
+            // 壓縮檔內容預覽（ZIP/TAR/RAR/7Z）
+            let p;
+            try { p = resolvePath(q.get('path') || ''); }
+            catch { return sendJson(res, 400, { error: '缺少路徑' }); }
+            if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) return sendJson(res, 404, { error: '找不到檔案' });
+            let entries;
+            try { entries = await listArchiveEntries(p); }
+            catch (e) { return sendJson(res, 500, { error: `無法讀取壓縮檔：${e.message}` }); }
+            return sendJson(res, 200, {
+              ok: true,
+              name: path.basename(p),
+              path: p,
+              entries,
+              count: entries.length,
+              totalSize: entries.reduce((s, e) => s + (e.size || 0), 0),
+            });
+          }
+
           case '/api/zipfile': {
             const f = q.get('f') || '';
             const meta = pendingZips.get(f);
@@ -828,22 +1409,138 @@ const server = http.createServer(async (req, res) => {
           }
 
           case '/api/backup': {
-            // 預設備份至「各檔案所在資料夾」下的 bak 子資料夾
+            // 備份範圍＝body.dir（目前資料夾）；選取項目為 paths／path（含子資料夾遞迴）
             const paths = (Array.isArray(body.paths) && body.paths.length) ? body.paths : (body.path ? [body.path] : []);
             if (!paths.length) return sendJson(res, 400, { error: '缺少檔案' });
-            const results = [];
-            for (const p of paths) {
-              const src = resolvePath(p);
-              if (!fs.existsSync(src) || fs.statSync(src).isDirectory()) continue;
-              const dir = path.dirname(src);
-              const bak = path.join(dir, 'bak');
-              await fsp.mkdir(bak, { recursive: true });
-              let dest = path.join(bak, path.basename(src));
-              if (fs.existsSync(dest)) dest = path.join(bak, backupName(path.basename(src)));
-              await fsp.copyFile(src, dest);
-              results.push(dest);
+            let scopeDir = null;
+            if (body.dir && typeof body.dir === 'string' && body.dir.trim()) {
+              try { scopeDir = resolvePath(body.dir); } catch { /* 略 */ }
             }
-            return sendJson(res, 200, { ok: true, results, backedUp: results.length });
+            if (!scopeDir || !isDir(scopeDir)) {
+              try { scopeDir = path.dirname(resolvePath(paths[0])); } catch { /* 略 */ }
+            }
+            if (!scopeDir || !isDir(scopeDir)) return sendJson(res, 400, { error: '備份範圍（目前資料夾）無效' });
+
+            // 1) 收集候選檔案：選取的檔案 ＋ 選取子資料夾遞迴內的所有檔案
+            const candidates = await collectBackupFiles(scopeDir, paths);
+            if (!candidates.length) {
+              return sendJson(res, 200, { ok: true, skip: true, count: 0, message: '選取範圍內沒有可備份的檔案' });
+            }
+
+            // 2) 僅備份具有封存標記（A）的檔案
+            const flagged = await filterArchiveFlagged(candidates);
+            if (!flagged.length) {
+              return sendJson(res, 200, { ok: true, skip: true, count: 0, message: '沒有具有封存標記（A）的檔案可備份' });
+            }
+
+            const bakDir = path.join(scopeDir, BAK_DIR);
+            const hasBak = fs.existsSync(bakDir);
+            const hist = hasBak ? loadBackupHistory(scopeDir) : null;
+            const stamp = backupStamp();
+            let mode, files, zipName, message;
+
+            if (!hasBak || !hist) {
+              // 3a) 全備份：.bak 不存在（或歷程遺失）→ 備份全部具標記檔案
+              mode = 'full';
+              files = flagged;
+              zipName = `f-${stamp}.zip`;
+            } else {
+              // 3b) 差異備份：比對歷程記錄（大小＋內容 sha256 雜湊），找出新增或內容異動的檔案
+              const changed = [];
+              for (const f of flagged) {
+                const rec = hist.files[f.rel];
+                if (!rec || rec.size !== f.size) { changed.push(f); continue; }
+                if (await sha256File(f.abs) !== rec.hash) changed.push(f);
+              }
+              files = changed;
+              // 先清除來源已不存在的舊記錄（維持歷程準確，不影響差異判斷）
+              let pruned = false;
+              for (const k of Object.keys(hist.files)) {
+                if (!fs.existsSync(path.join(scopeDir, k))) { delete hist.files[k]; pruned = true; }
+              }
+              if (!files.length) {
+                if (pruned) saveBackupHistory(scopeDir, hist);
+                return sendJson(res, 200, {
+                  ok: true, skip: true, mode: 'incr', count: 0,
+                  message: '無差異：所有具封存標記（A）的檔案內容皆與上次備份相同',
+                });
+              }
+              mode = 'incr';
+              zipName = `i-${stamp}.zip`;
+            }
+
+            // 4) 打包 ZIP 至 .bak 資料夾（deflate 壓縮；zip 內以目前資料夾為根、相對路徑為條目名）
+            await fsp.mkdir(bakDir, { recursive: true });
+            zipName = uniqueZipName(bakDir, zipName);
+            const entries = files.map((f) => ({ zipName: f.rel, fsPath: f.abs }));
+            const { buf, hashes } = buildZip(entries, { withHashes: true });
+            fs.writeFileSync(path.join(bakDir, zipName), buf);
+
+            // 5) 更新備份歷程記錄（記錄大小／修改時間／內容 sha256）
+            const newHist = hist || { version: 2, backups: [], files: {} };
+            for (const f of files) {
+              newHist.files[f.rel] = { size: f.size, mtime: f.mtime, hash: hashes.get(f.rel) };
+            }
+            if (mode === 'full') {
+              // 全備份：歷程僅保留本次備份的檔案
+              const rels = new Set(files.map((f) => f.rel));
+              for (const k of Object.keys(newHist.files)) if (!rels.has(k)) delete newHist.files[k];
+            }
+            newHist.backups.push({ file: zipName, type: mode, at: new Date().toISOString(), count: files.length });
+            newHist.last = zipName;
+            saveBackupHistory(scopeDir, newHist);
+
+            // 6) 備份成功後清除封存標記（A），使下次僅備份新異動的檔案（Windows 磁碟）
+            let cleared = 0;
+            const winFiles = files.map((f) => toWindowsPath(f.abs)).filter(Boolean);
+            if (winFiles.length) {
+              try { cleared = await clearWinArchiveFlags(winFiles); }
+              catch (e) { console.error('清除封存標記失敗：', e.message); }
+            }
+
+            message = mode === 'full'
+              ? `全備份完成：已備份 ${files.length} 個檔案至 ${BAK_DIR}`
+              : `差異備份完成：已備份 ${files.length} 個異動檔案至 ${BAK_DIR}`;
+            return sendJson(res, 200, { ok: true, mode, zip: zipName, count: files.length, bak: bakDir, cleared, message });
+          }
+
+          case '/api/restore': {
+            // 還原壓縮檔（ZIP/TAR/RAR/7Z）至 destDir（預設：.bak 的上一層＝原始備份目錄）
+            let zipPath;
+            try { zipPath = resolvePath(body.zip || ''); }
+            catch { return sendJson(res, 400, { error: '缺少壓縮檔路徑' }); }
+            if (!fs.existsSync(zipPath) || fs.statSync(zipPath).isDirectory()) {
+              return sendJson(res, 400, { error: '找不到壓縮檔' });
+            }
+            let destDir;
+            try { destDir = body.destDir ? resolvePath(body.destDir) : defaultRestoreDir(zipPath); }
+            catch { return sendJson(res, 400, { error: '還原目標資料夾無效' }); }
+            if (!isDir(destDir)) return sendJson(res, 400, { error: '還原目標資料夾無效' });
+            const overwrite = body.overwrite !== false;
+            let result;
+            try { result = await extractArchive(zipPath, destDir, overwrite); }
+            catch (e) { return sendJson(res, 500, { error: `還原失敗：${e.message}` }); }
+            return sendJson(res, 200, {
+              ok: true,
+              restored: result.restored,
+              skipped: result.skipped,
+              errors: result.errors || [],
+              destDir,
+              zip: zipPath,
+            });
+          }
+
+          case '/api/dedup': {
+            // 重整：掃描目前資料夾與子目錄，列出內容相同的重複檔案（先比長度再比 sha256）
+            let dir;
+            try { dir = resolvePath(body.dir || ''); }
+            catch { return sendJson(res, 400, { error: '缺少資料夾' }); }
+            if (!isDir(dir)) return sendJson(res, 400, { error: '資料夾無效' });
+            let groups;
+            try { groups = await scanDuplicates(dir); }
+            catch (e) { return sendJson(res, 500, { error: `掃描失敗：${e.message}` }); }
+            const dupCount = groups.reduce((s, g) => s + g.files.length, 0);
+            return sendJson(res, 200, { ok: true, dir, groups, groupCount: groups.length, dupCount });
           }
 
           case '/api/rename': {

@@ -31,6 +31,9 @@ const TYPE_ICONS = {
   generic: { color: '#94a3b8', path: ICON_PATH.file },
 };
 
+/* 備份：.bak 資料夾名稱（與後端 server.js 一致） */
+const BAK_FOLDER = '.bak';
+
 const EXT_MAP = {
   // 圖片
   png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image',
@@ -99,6 +102,8 @@ const App = {
       treeErrors: {},           // path -> bool
       destModal: { show: false, mode: 'copy', src: null, srcs: null, srcName: '', dest: '', destOk: false, destInfo: false },
       renameModal: { show: false, path: '', oldName: '', newName: '', error: '' },
+      dedupModal: { show: false, loading: false, error: '', groups: [], groupCount: 0, dupCount: 0 },
+      dedupSel: {},              // path -> true（重整：勾選要刪除的重複檔案）
       preview: { show: false, name: '', path: '', kind: '', content: '', rendered: '', info: '', loading: false, error: '' },
       toast: { show: false, msg: '', type: 'ok' },
     };
@@ -155,6 +160,17 @@ const App = {
         crumbs.push({ name: part, path: acc });
       }
       return crumbs;
+    },
+
+    /* 重整：勾選統計 */
+    dedupSelectedCount() {
+      return Object.keys(this.dedupSel).length;
+    },
+
+    dedupFreedSize() {
+      let s = 0;
+      for (const g of this.dedupModal.groups) for (const f of g.files) if (this.dedupSel[f.path]) s += f.size;
+      return s;
     },
   },
 
@@ -292,9 +308,10 @@ const App = {
       try {
         const d = await this.api('/api/backup', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: f.path }),
+          body: JSON.stringify({ path: f.path, dir: this.selectedDir ? this.selectedDir.path : null }),
         });
-        this.showToast(`已備份至 ${d.dest}`);
+        if (d.skip) { this.showToast(d.message, 'warn'); return; }
+        this.showToast(d.message || `已備份 ${d.count} 個檔案至 ${BAK_FOLDER}`);
       } catch (e) {
         this.showToast('備份失敗：' + e.message, 'err');
       }
@@ -341,9 +358,13 @@ const App = {
       try {
         const d = await this.api('/api/backup', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ paths }),
+          body: JSON.stringify({ paths, dir: this.selectedDir ? this.selectedDir.path : null }),
         });
-        this.showToast(`已備份 ${d.backedUp} 個檔案至各自的 bak 資料夾`);
+        if (d.skip) {
+          this.showToast(d.message, 'warn');
+        } else {
+          this.showToast(d.message || `已備份 ${d.count} 個檔案至 ${BAK_FOLDER}`);
+        }
         this.clearSelection();
         await this.loadFiles();
       } catch (e) {
@@ -362,6 +383,73 @@ const App = {
         });
         this.showToast(`已刪除 ${d.deleted} 個項目`);
         this.clearSelection();
+        await this.loadFiles();
+      } catch (e) {
+        this.showToast('刪除失敗：' + e.message, 'err');
+      }
+    },
+
+    /* ---- 重整：找尋與刪除內容重複的檔案 ---- */
+    async openDedup() {
+      if (!this.selectedDir) return;
+      this.dedupModal.show = true;
+      this.dedupModal.loading = true;
+      this.dedupModal.error = '';
+      this.dedupSel = {};
+      try {
+        const d = await this.api('/api/dedup', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dir: this.selectedDir.path }),
+        });
+        this.dedupModal.groups = d.groups || [];
+        this.dedupModal.groupCount = d.groupCount || 0;
+        this.dedupModal.dupCount = d.dupCount || 0;
+        this.dedupSel = this.defaultDedupSel();
+      } catch (e) {
+        this.dedupModal.error = e.message;
+        this.dedupModal.groups = [];
+        this.dedupModal.groupCount = 0;
+        this.dedupModal.dupCount = 0;
+      } finally {
+        this.dedupModal.loading = false;
+      }
+    },
+
+    closeDedup() {
+      this.dedupModal.show = false;
+      this.dedupModal.groups = [];
+      this.dedupSel = {};
+    },
+
+    defaultDedupSel() {
+      const s = {};
+      for (const g of this.dedupModal.groups) for (const f of g.files) if (f.defaultChecked) s[f.path] = true;
+      return s;
+    },
+
+    toggleDedup(p) {
+      if (this.dedupSel[p]) delete this.dedupSel[p];
+      else this.dedupSel[p] = true;
+    },
+
+    resetDedup() { this.dedupSel = this.defaultDedupSel(); },
+    clearDedup() { this.dedupSel = {}; },
+
+    async confirmDedup() {
+      const paths = Object.keys(this.dedupSel);
+      if (!paths.length) { this.showToast('未勾選任何檔案', 'warn'); return; }
+      // 警告：若某組重複檔案被全部勾選（不留任何副本）
+      const wiped = this.dedupModal.groups.filter((g) => g.files.every((f) => this.dedupSel[f.path])).length;
+      let msg = `確定刪除勾選的 ${paths.length} 個重複檔案（釋放 ${this.fmtSize(this.dedupFreedSize)}）嗎？此操作無法復原。`;
+      if (wiped) msg = `⚠ ${wiped} 組重複檔案將被全部刪除（不留任何副本）！\n` + msg;
+      if (!confirm(msg)) return;
+      try {
+        const d = await this.api('/api/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths }),
+        });
+        this.showToast(`已刪除 ${d.deleted} 個重複檔案（釋放 ${this.fmtSize(this.dedupFreedSize)}）`);
+        this.closeDedup();
         await this.loadFiles();
       } catch (e) {
         this.showToast('刪除失敗：' + e.message, 'err');
@@ -447,6 +535,15 @@ const App = {
     /* ---- 作業：預覽（文字／Markdown／HTML） ---- */
     isPreviewable(f) {
       return !f.isDir && /\.(txt|md|markdown|html?|xhtml)$/i.test(f.name);
+    },
+
+    /* ---- 壓縮檔（ZIP/RAR/7Z/TAR）獨立分頁預覽與還原 ---- */
+    isArchive(f) {
+      return !f.isDir && /\.(zip|rar|7z|tar)$/i.test(f.name);
+    },
+
+    doPreviewArchive(f) {
+      window.open('/archive.html?path=' + encodeURIComponent(f.path), '_blank');
     },
 
     async openPreview(f) {

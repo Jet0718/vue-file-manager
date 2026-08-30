@@ -2,12 +2,14 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { JSDOM } = require('jsdom');
 
 const root = path.join(__dirname, '..');
 
-// 在 vm sandbox 中載入 Vue global build（不需要 DOM）
+// 在 vm sandbox 中載入 Vue global build（提供 jsdom 的 document，供編譯器解碼 HTML entity）
 const vueCode = fs.readFileSync(path.join(root, 'public/vendor/vue.global.prod.js'), 'utf8');
-const vueSandbox = { console };
+const dom = new JSDOM('<!doctype html><html><body></body></html>');
+const vueSandbox = { console, document: dom.window.document };
 vm.createContext(vueSandbox);
 vm.runInContext(vueCode, vueSandbox);
 const Vue = vueSandbox.Vue;

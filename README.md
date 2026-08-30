@@ -4,7 +4,8 @@
 
 ## 功能
 
-- **複選批量操作**：清單列有勾選框（表頭可全選，Ctrl/⌘+點選亦可切換），勾選後出現批量工具列，可對多個檔案／資料夾執行**複製**（含遞迴複製資料夾）、**搬移**、**備份**（各自到 bak）、**刪除**、**打包 ZIP 下載**（資料夾遞迴含入）
+- **重整（去重）**：工具列「🔁 重整」按鈕可直接掃描目前資料夾與所有子目錄，**先依檔案長度分組、再以 sha256 內容雜湊比對**找尋內容相同的重複檔案，彈窗列出各組並**預設勾選檔名較長者**（保留檔名最短者），確認後刪除勾選的重複檔案（可個別勾選／依預設／全不選）
+- **複選批量操作**：清單列有勾選框（表頭可全選，Ctrl/⌘+點選亦可切換），勾選後出現批量工具列，可對多個檔案／資料夾執行**複製**（含遞迴複製資料夾）、**搬移**、**備份**（僅含封存標記 A 的檔案，全備份／差異備份，備份後自動清除 A）、**刪除**、**打包 ZIP 下載**（資料夾遞迴含入，deflate 壓縮）
 - **Everything 全域搜尋**：頂部搜尋列可呼叫 Windows 的 **Everything** 索引做即時全域搜尋（附 `es.exe`，零設定）；支援 Everything 語法（`ext:`、`file:`、`path:`、`dm:`…）與中文關鍵字，結果依修改日期新→舊排序，可勾選「目前資料夾」限定範圍、直接開啟／預覽／跳至所在資料夾；Everything 不可用時自動降級為本機搜尋
 - **常用目錄區（三個分頁）**：
   - **目錄**：樹狀顯示本機常用目錄（家目錄、桌面、文件、下載、圖片、音樂、影片、根目錄等），可逐層展開
@@ -18,7 +19,8 @@
   - **複製**：選擇目的地資料夾後複製
   - **搬移**：選擇目的地資料夾後搬移（跨磁碟自動改為複製＋刪除）
   - **更名**：彈窗輸入新名稱（Enter 確認、Esc 取消），檔案與資料夾皆可；若為喜好資料夾會自動同步路徑
-  - **備份**：預設備份至「目前檔案所在資料夾」下的 `bak` 子資料夾（已存在時自動加上時間戳）
+  - **備份**：僅備份具**封存標記（A）**的檔案（Windows 磁碟上的檔案；Linux 檔案系統視為皆有標記）。`.bak` 資料夾不存在（或歷程遺失）時做**全備份**，輸出 `f-YYYYMMDDHHmmss.zip`；`.bak` 存在且 `.backup-history.json` 歷程存在時，以**內容 sha256 雜湊＋大小**比對歷程，僅備份內容異動的檔案做**差異備份**，輸出 `i-YYYYMMDDHHmmss.zip`；無差異則提示後直接結束。**備份成功後自動清除 Windows 檔案的 A 標記**，下次僅新異動（A 會自動重設）的檔案會被備份。zip 以 **deflate 壓縮**（壓縮無益時自動改純儲存），條目以目前資料夾為根、使用相對路徑，歷程文件以「.」前綴存放在目前資料夾
+  - **壓縮檔預覽**：ZIP／RAR／7Z／TAR 檔案列有「壓縮檔」按鈕，可在**獨立分頁**檢視壓縮檔內容（檔名、大小、壓縮後大小、格式），並可一鍵**還原**至指定資料夾（預設為原始備份目錄；含路徑穿越防護與 CRC 驗證；RAR／7Z 需 Windows 的 7-Zip 或 tar.exe）
   - **下載**／**刪除**（附帶功能）
 - **WSL 支援**：在 WSL（Windows Subsystem for Linux）執行時自動偵測，樹狀目錄加入 **Windows 磁碟**（`/mnt/c`、`/mnt/d`…），可完整瀏覽 Windows 目錄；輸入 Windows 路徑（`C:\Users\xxx`）會自動轉譯為 WSL 路徑
 - 複製／搬移目的地可用樹狀目錄點選，也可直接輸入路徑；若檔名衝突會自動以 `(1)`、`(2)`…命名，避免覆蓋
@@ -151,7 +153,10 @@ file-manager/
 | GET | `/api/favorites` | 喜好資料夾清單（持久化於 data/favorites.json） |
 | POST / DELETE | `/api/favorites` | 加入／移除喜好資料夾（body: `{ path }`） |
 | POST | `/api/copy` / `/api/move` | 複製／搬移（body: `{ srcs: [路徑…], destDir }`，單一亦可傳 `src`） |
-| POST | `/api/backup` | 備份（body: `{ paths: [路徑…] }`） |
+| POST | `/api/backup` | 備份（body: `{ paths: [路徑…], dir: 目前資料夾 }`，單一亦可傳 `path`；僅備份具封存標記 A 的檔案，.bak 不存在時全備份 `f-*.zip`，否則依 `.backup-history.json` 的 sha256 比對做差異備份 `i-*.zip`，無差異回傳 skip，備份後清除 A） |
+| GET | `/api/archive?path=…` | 壓縮檔內容預覽（ZIP／TAR 原生解析；RAR／7Z 需 7-Zip 或 Windows tar.exe） |
+| POST | `/api/restore` | 還原壓縮檔（body: `{ zip, destDir?, overwrite? }`；預設還原至 .bak 上一層；含路徑穿越防護） |
+| POST | `/api/dedup` | 重整掃描（body: `{ dir }`；先比長度再比 sha256，列出內容重複的檔案並預設勾選檔名較長者） |
 | POST | `/api/rename` | 更名（body: `{ path, newName }`，僅大小寫變更亦允許） |
 | POST | `/api/delete` | 刪除（body: `{ paths: [路徑…] }`） |
 | POST | `/api/zip` / GET `/api/zipfile` | 選取項目打包 ZIP 下載（資料夾遞迴） |
@@ -166,7 +171,10 @@ file-manager/
 | POST | `/api/open` | 以系統預設應用程式開啟 |
 | POST | `/api/copy` | 複製（`{ src, destDir }`） |
 | POST | `/api/move` | 搬移（`{ src, destDir }`） |
-| POST | `/api/backup` | 備份至來源資料夾的 `bak` 子資料夾 |
+| POST | `/api/backup` | 備份（body: `{ paths, dir }`；僅含封存標記 A 的檔案：無 .bak 時全備份 `f-時間.zip`，有 .bak 且歷程存在時以 sha256 比對做差異備份 `i-時間.zip`，無差異回傳 skip，備份後清除 A） |
+| GET | `/api/archive?path=…` | 壓縮檔內容預覽（獨立分頁 archive.html 使用） |
+| POST | `/api/restore` | 還原壓縮檔（body: `{ zip, destDir?, overwrite? }`） |
+| POST | `/api/dedup` | 重整掃描（body: `{ dir }`；找尋內容重複檔案，刪除動作沿用 `/api/delete`） |
 | POST | `/api/delete` | 刪除 |
 
 > 安全性備註：此工具僅綁定 `127.0.0.1`，為個人本機使用而設計，可存取執行帳號權限內的完整檔案系統。

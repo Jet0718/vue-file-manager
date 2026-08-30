@@ -90,13 +90,14 @@ async function main() {
   const copied = ['a.txt', 'b.md', 'c.pdf', 'd.png', 'e.txt'].every((n) => fs.existsSync(path.join(TEST_DIR, 'dest', n)));
   console.log('   複製結果: dest 內 5 個檔案都在?', copied, '| toast:', vm.toast.msg, '| 選取清除?', vm.selectionCount === 0);
 
-  // 6) 批量備份
+  // 6) 批量備份（新流程：.bak 內產生全備份 f-*.zip，內含全部具標記檔案）
   vm.toggleSelectAll();
   await sleep(200);
   vm.batchBackup();
-  await sleep(600);
-  const bakCount = fs.readdirSync(path.join(TEST_DIR, 'bak')).length;
-  console.log('6) 批量備份: bak 內檔案數:', bakCount, '| toast:', vm.toast.msg);
+  await sleep(900);
+  const bakFiles = fs.existsSync(path.join(TEST_DIR, '.bak')) ? fs.readdirSync(path.join(TEST_DIR, '.bak')) : [];
+  const bakCount = bakFiles.filter((n) => /^f-\d{14}\.zip$/.test(n)).length;
+  console.log('6) 批量備份: .bak 內全備份 zip 數:', bakCount, '| toast:', vm.toast.msg);
 
   // 7) 批量刪除（a.txt 與 b.md）
   vm.clearSelection();
@@ -137,7 +138,7 @@ print(sorted(z.namelist()))
   const ok = checkboxes.length === 6
     && vm.selectionCount === 2
     && d.querySelector('.batch-bar') !== null
-    && copied && bakCount === 5
+    && copied && bakCount === 1
     && !fs.existsSync(path.join(TEST_DIR, 'a.txt')) && !fs.existsSync(path.join(TEST_DIR, 'b.md'))
     && zipValid
     && logs.length === 0;

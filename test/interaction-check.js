@@ -156,8 +156,12 @@ async function main() {
   const copyOk = fs.existsSync(path.join(TEST_DIR, 'docs', 'report.pdf'));
   const bakBtn = [...d.querySelectorAll('.file-row')].find((r) => r.querySelector('.fname').textContent.includes('report.pdf')).querySelectorAll('.op');
   [...bakBtn].find((b) => b.textContent.trim() === '備份').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-  await sleep(600);
-  const bakOk = fs.existsSync(path.join(TEST_DIR, 'bak', 'report.pdf'));
+  await sleep(800);
+  // 新備份流程：.bak 資料夾內產生 f-YYYYMMDDHHmmss.zip，並在目前資料夾建立 .backup-history.json 歷程
+  const bakFiles = fs.existsSync(path.join(TEST_DIR, '.bak')) ? fs.readdirSync(path.join(TEST_DIR, '.bak')) : [];
+  const bakOk = fs.existsSync(path.join(TEST_DIR, '.bak'))
+    && bakFiles.some((n) => /^f-\d{14}\.zip$/.test(n))
+    && fs.existsSync(path.join(TEST_DIR, '.backup-history.json'));
   const mvBtn = [...d.querySelectorAll('.file-row')].find((r) => r.querySelector('.fname').textContent.includes('notes.txt')).querySelectorAll('.op');
   [...mvBtn].find((b) => b.textContent.trim() === '搬移').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   await sleep(300);

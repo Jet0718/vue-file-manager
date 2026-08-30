@@ -97,6 +97,7 @@
           <option value="size">大小</option>
         </select>
         <label class="check" title="資料夾固定顯示在最上方"><input type="checkbox" v-model="pinDirs"> 資料夾置頂</label>
+        <button v-if="selectedDir" class="btn" @click="openDedup" title="掃描目前資料夾與子目錄，找尋內容相同的重複檔案（先比長度再比 sha256），預設勾選檔名較長者，確認後刪除">🔁 重整</button>
       </div>
 
       <!-- 批量操作工具列 -->
@@ -104,7 +105,7 @@
         <span class="batch-count">已選取 {{ selectionCount }} 個項目</span>
         <button class="btn" @click="batchCopy" title="複製選取項目到其他資料夾">📋 複製</button>
         <button class="btn" @click="batchMove" title="搬移選取項目到其他資料夾">➡ 搬移</button>
-        <button class="btn" @click="batchBackup" title="備份選取檔案至各自資料夾的 bak">💾 備份</button>
+        <button class="btn" @click="batchBackup" title="僅備份具封存標記（A）的檔案（無 .bak 時全備份 f-*.zip，否則差異備份 i-*.zip）">💾 備份</button>
         <button class="btn" @click="batchDownload" title="打包成 ZIP 下載">📦 下載 ZIP</button>
         <button class="btn danger-btn" @click="batchDelete" title="刪除選取項目">🗑 刪除</button>
         <button class="op" @click="clearSelection" title="清除選取">✕ 清除</button>
@@ -138,10 +139,11 @@
           <span class="col-ops">
             <button class="op" v-if="!f.isDir" @click.stop="doOpen(f)" title="以系統預設應用程式開啟">開啟</button>
             <button class="op" v-if="isPreviewable(f)" @click.stop="openPreview(f)" title="文字／Markdown／HTML 預覽">預覽</button>
+            <button class="op" v-if="isArchive(f)" @click.stop="doPreviewArchive(f)" title="在獨立分頁檢視壓縮檔內容並可還原">壓縮檔</button>
             <button class="op" @click.stop="openDestModal('copy', f)" title="複製到其他資料夾">複製</button>
             <button class="op" @click.stop="openDestModal('move', f)" title="搬移到其他資料夾">搬移</button>
             <button class="op" @click.stop="openRename(f)" title="重新命名">更名</button>
-            <button class="op" v-if="!f.isDir" @click.stop="doBackup(f)" title="備份至目前資料夾的 bak 子資料夾">備份</button>
+            <button class="op" v-if="!f.isDir" @click.stop="doBackup(f)" title="僅備份具封存標記（A）的檔案至 .bak 資料夾">備份</button>
             <button class="op" v-if="!f.isDir" @click.stop="doDownload(f)" title="下載檔案">下載</button>
             <button class="op danger" @click.stop="doDelete(f)" title="刪除（無法復原）">刪除</button>
           </span>
@@ -252,6 +254,43 @@
       <div class="modal-actions">
         <button class="btn" @click="closeRename">取消</button>
         <button class="btn primary" :disabled="!renameModal.newName.trim()" @click="confirmRename">確認更名</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重整：找尋並刪除內容重複的檔案 -->
+  <div class="modal-mask" v-if="dedupModal.show" @click.self="closeDedup">
+    <div class="modal dedup-modal" @click.stop>
+      <h3>🔁 重整：找尋重複檔案（<em>{{ selectedDir ? selectedDir.path : '' }}</em>）</h3>
+      <p class="hint" v-if="dedupModal.loading">掃描中…（先依檔案長度分組，再以 sha256 比對內容）</p>
+      <p class="hint" v-else-if="!dedupModal.error && dedupModal.groups.length">
+        共 {{ dedupModal.groupCount }} 組重複、{{ dedupModal.dupCount }} 個檔案 ｜
+        已勾選 <b>{{ dedupSelectedCount }}</b> 個，將釋放 <b>{{ fmtSize(dedupFreedSize) }}</b>
+        （每組預設保留檔名最短者）
+      </p>
+      <div class="dedup-body">
+        <div v-if="dedupModal.loading" class="empty">掃描中…</div>
+        <div v-else-if="dedupModal.error" class="empty dedup-err">{{ dedupModal.error }}</div>
+        <div v-else-if="!dedupModal.groups.length" class="empty">沒有內容相同的重複檔案 🎉</div>
+        <template v-else>
+          <div v-for="(g, gi) in dedupModal.groups" :key="gi" class="dedup-group">
+            <div class="dedup-group-head">
+              {{ g.files.length }} 個相同檔案 ｜ {{ fmtSize(g.size) }} ｜ sha256 {{ g.hash.slice(0, 12) }}…
+            </div>
+            <label v-for="f in g.files" :key="f.path" class="dedup-item" :class="{ checked: !!dedupSel[f.path], keep: !f.defaultChecked }" :title="f.path">
+              <input type="checkbox" :checked="!!dedupSel[f.path]" @change="toggleDedup(f.path)">
+              <span class="dedup-name">{{ f.name }}</span>
+              <span class="dedup-meta">{{ f.defaultChecked ? '刪除' : '保留' }} ｜ {{ fmtDate(f.mtime) }}</span>
+            </label>
+          </div>
+        </template>
+      </div>
+      <div class="modal-actions" v-if="!dedupModal.loading && !dedupModal.error && dedupModal.groups.length">
+        <button class="btn" @click="resetDedup" title="依預設勾選（保留各組檔名最短者）">依預設</button>
+        <button class="btn" @click="clearDedup" title="全部取消勾選">全不選</button>
+        <span style="flex:1"></span>
+        <button class="btn" @click="closeDedup">取消</button>
+        <button class="btn danger-btn" @click="confirmDedup" title="刪除勾選的重複檔案">刪除勾選檔案</button>
       </div>
     </div>
   </div>
