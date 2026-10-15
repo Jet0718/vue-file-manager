@@ -262,12 +262,40 @@
   <div class="modal-mask" v-if="dedupModal.show" @click.self="closeDedup">
     <div class="modal dedup-modal" @click.stop>
       <h3>🔁 重整：找尋重複檔案（<em>{{ selectedDir ? selectedDir.path : '' }}</em>）</h3>
-      <p class="hint" v-if="dedupModal.loading">掃描中…（先依檔案長度分組，再以 sha256 比對內容）</p>
+
+      <!-- 處理中：進度條、目前項目與暫停／繼續／中止 -->
+      <div v-if="dedupBusy" class="dedup-progress">
+        <div class="dedup-progress-head">
+          <span class="dedup-phase">{{ dedupPhaseLabel }}</span>
+          <span class="dedup-progress-state" :class="dedupModal.state">
+            <template v-if="dedupModal.state === 'paused'">⏸ 已暫停</template>
+            <template v-else-if="dedupModal.state === 'cancelled'">⛔ 中止中…</template>
+            <template v-else>⏱ {{ fmtDuration(dedupModal.elapsedMs) }}</template>
+          </span>
+        </div>
+        <div class="dedup-bar" :class="{ indeterminate: dedupModal.percent == null }">
+          <div class="dedup-bar-fill" :style="dedupModal.percent == null ? {} : { width: dedupModal.percent + '%' }"></div>
+        </div>
+        <div class="dedup-progress-nums">
+          {{ dedupProgressText }}
+          <span v-if="dedupModal.percent != null">｜{{ dedupModal.percent }}%</span>
+        </div>
+        <div class="dedup-current" v-if="dedupModal.current" :title="dedupModal.current">{{ dedupModal.current }}</div>
+        <div class="dedup-progress-actions">
+          <button v-if="dedupModal.state === 'running'" class="btn" @click="dedupPause" title="暫停處理">⏸ 暫停</button>
+          <button v-else-if="dedupModal.state === 'paused'" class="btn primary" @click="dedupResume" title="繼續處理">▶ 繼續</button>
+          <span style="flex:1"></span>
+          <button class="btn danger-btn" :disabled="dedupModal.state === 'cancelled'" @click="dedupCancel" title="中止處理（已完成的動作會保留）">⛔ 中止</button>
+        </div>
+      </div>
+
       <p class="hint" v-else-if="!dedupModal.error && dedupModal.groups.length">
         共 {{ dedupModal.groupCount }} 組重複、{{ dedupModal.dupCount }} 個檔案 ｜
         已勾選 <b>{{ dedupSelectedCount }}</b> 個，將釋放 <b>{{ fmtSize(dedupFreedSize) }}</b>
         （每組預設保留檔名最短者）
       </p>
+      <p class="hint dedup-warn" v-if="dedupModal.truncated && !dedupBusy">已達掃描上限（50000 個項目），結果可能不完整。</p>
+
       <div class="dedup-body">
         <div v-if="dedupModal.loading" class="empty">掃描中…</div>
         <div v-else-if="dedupModal.error" class="empty dedup-err">{{ dedupModal.error }}</div>
@@ -278,19 +306,23 @@
               {{ g.files.length }} 個相同檔案 ｜ {{ fmtSize(g.size) }} ｜ sha256 {{ g.hash.slice(0, 12) }}…
             </div>
             <label v-for="f in g.files" :key="f.path" class="dedup-item" :class="{ checked: !!dedupSel[f.path], keep: !f.defaultChecked }" :title="f.path">
-              <input type="checkbox" :checked="!!dedupSel[f.path]" @change="toggleDedup(f.path)">
+              <input type="checkbox" :checked="!!dedupSel[f.path]" :disabled="dedupBusy" @change="toggleDedup(f.path)">
               <span class="dedup-name">{{ f.name }}</span>
               <span class="dedup-meta">{{ f.defaultChecked ? '刪除' : '保留' }} ｜ {{ fmtDate(f.mtime) }}</span>
             </label>
           </div>
         </template>
       </div>
-      <div class="modal-actions" v-if="!dedupModal.loading && !dedupModal.error && dedupModal.groups.length">
+
+      <div class="modal-actions" v-if="!dedupBusy && !dedupModal.error && dedupModal.groups.length">
         <button class="btn" @click="resetDedup" title="依預設勾選（保留各組檔名最短者）">依預設</button>
         <button class="btn" @click="clearDedup" title="全部取消勾選">全不選</button>
         <span style="flex:1"></span>
         <button class="btn" @click="closeDedup">取消</button>
         <button class="btn danger-btn" @click="confirmDedup" title="刪除勾選的重複檔案">刪除勾選檔案</button>
+      </div>
+      <div class="modal-actions" v-else-if="!dedupBusy">
+        <button class="btn" @click="closeDedup">關閉</button>
       </div>
     </div>
   </div>

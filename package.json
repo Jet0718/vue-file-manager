@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/templates-check.js && node test/render-check.js && node test/interaction-check.js && node test/search-check.js && node test/multiselect-check.js && node test/rename-check.js && node test/backup-check.js && node test/archive-check.js && node test/archive-html-check.js && node test/dedup-check.js && node test/dedup-ui-check.js"
+    "test": "node test/templates-check.js && node test/render-check.js && node test/interaction-check.js && node test/search-check.js && node test/multiselect-check.js && node test/rename-check.js && node test/backup-check.js && node test/archive-check.js && node test/archive-html-check.js && node test/dedup-check.js && node test/dedup-ui-check.js && node test/dedup-progress-check.js && node test/dedup-progress-ui-check.js"
   },
   "license": "MIT",
   "devDependencies": {

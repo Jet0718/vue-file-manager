@@ -305,6 +305,31 @@ select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; 
 .dedup-name { font-size: 13px; font-weight: 600; word-break: break-all; min-width: 0; }
 .dedup-meta { font-size: 12px; color: var(--muted); white-space: nowrap; margin-left: auto; }
 .dedup-err { color: var(--danger); }
+.dedup-warn { color: #b45309; }
+
+/* 重整：處理中進度面板 */
+.dedup-progress {
+  display: flex; flex-direction: column; gap: 7px; flex: none;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #f8fafc;
+}
+.dedup-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.dedup-phase { font-size: 13px; font-weight: 600; }
+.dedup-progress-state { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.dedup-progress-state.paused { color: #b45309; font-weight: 600; }
+.dedup-progress-state.cancelled { color: var(--danger); font-weight: 600; }
+.dedup-bar { position: relative; height: 8px; border-radius: 999px; background: #e2e8f0; overflow: hidden; }
+.dedup-bar-fill { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .25s ease; }
+.dedup-bar.indeterminate .dedup-bar-fill { width: 35%; animation: dedup-slide 1.1s ease-in-out infinite; }
+@keyframes dedup-slide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
+.dedup-progress-nums { font-size: 12px; color: var(--muted); }
+.dedup-current {
+  font-size: 12px; color: var(--muted); font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dedup-progress-actions { display: flex; align-items: center; gap: 8px; }
 
 
 /* ---- 搜尋彈窗 ---- */

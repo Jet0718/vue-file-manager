@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **重整（去重）**：工具列「🔁 重整」按鈕可直接掃描目前資料夾與所有子目錄，**先依檔案長度分組、再以 sha256 內容雜湊比對**找尋內容相同的重複檔案，彈窗列出各組並**預設勾選檔名較長者**（保留檔名最短者），確認後刪除勾選的重複檔案（可個別勾選／依預設／全不選）
+- **重整（去重）**：工具列「🔁 重整」按鈕可直接掃描目前資料夾與所有子目錄，**先依檔案長度分組、再以 sha256 內容雜湊比對**找尋內容相同的重複檔案，彈窗列出各組並**預設勾選檔名較長者**（保留檔名最短者），確認後刪除勾選的重複檔案（可個別勾選／依預設／全不選）。掃描與刪除都是**背景工作**：彈窗即時顯示**進度條、目前處理的檔案、已掃描／已比對數量與經過時間**，並可隨時**暫停、繼續、中止**（中止後已完成的動作會保留，不會回滾）
 - **複選批量操作**：清單列有勾選框（表頭可全選，Ctrl/⌘+點選亦可切換），勾選後出現批量工具列，可對多個檔案／資料夾執行**複製**（含遞迴複製資料夾）、**搬移**、**備份**（僅含封存標記 A 的檔案，全備份／差異備份，備份後自動清除 A）、**刪除**、**打包 ZIP 下載**（資料夾遞迴含入，deflate 壓縮）
 - **Everything 全域搜尋**：頂部搜尋列可呼叫 Windows 的 **Everything** 索引做即時全域搜尋（附 `es.exe`，零設定）；支援 Everything 語法（`ext:`、`file:`、`path:`、`dm:`…）與中文關鍵字，結果依修改日期新→舊排序，可勾選「目前資料夾」限定範圍、直接開啟／預覽／跳至所在資料夾；Everything 不可用時自動降級為本機搜尋
 - **常用目錄區（三個分頁）**：
@@ -133,7 +133,7 @@ file-manager/
 │   ├── js/templates.js        # Vue 模板（獨立檔案）
 │   ├── js/app.js              # Vue 3 應用程式
 │   └── vendor/                # 本機離線資源（vue、marked）
-└── test/templates-check.js    # 模板語法驗證（npm test）
+└── test/                      # 自動化測試（npm test）：模板／渲染／互動／搜尋／複選／更名／備份／壓縮檔／重整（含進度與暫停、繼續、中止）
 ```
 
 ## 疑難排解
@@ -156,7 +156,11 @@ file-manager/
 | POST | `/api/backup` | 備份（body: `{ paths: [路徑…], dir: 目前資料夾 }`，單一亦可傳 `path`；僅備份具封存標記 A 的檔案，.bak 不存在時全備份 `f-*.zip`，否則依 `.backup-history.json` 的 sha256 比對做差異備份 `i-*.zip`，無差異回傳 skip，備份後清除 A） |
 | GET | `/api/archive?path=…` | 壓縮檔內容預覽（ZIP／TAR 原生解析；RAR／7Z 需 7-Zip 或 Windows tar.exe） |
 | POST | `/api/restore` | 還原壓縮檔（body: `{ zip, destDir?, overwrite? }`；預設還原至 .bak 上一層；含路徑穿越防護） |
-| POST | `/api/dedup` | 重整掃描（body: `{ dir }`；先比長度再比 sha256，列出內容重複的檔案並預設勾選檔名較長者） |
+| POST | `/api/dedup` | 重整掃描（同步版，body: `{ dir }`；先比長度再比 sha256，列出內容重複的檔案並預設勾選檔名較長者。相容舊介面，無進度／暫停） |
+| POST | `/api/dedup/start` | 重整掃描（背景工作，body: `{ dir }`；回傳 `{ jobId }`，前端再輪詢 `/api/dedup/status` 取得進度） |
+| POST | `/api/dedup/delete/start` | 重整刪除（背景工作，body: `{ paths: [路徑…] }`；回傳 `{ jobId }`；同樣支援進度與暫停／繼續／中止） |
+| GET | `/api/dedup/status?id=jobId` | 查詢重整工作進度（`state`：`running`／`paused`／`done`／`cancelled`／`error`；`phase`、`percent`、`current`、`scanned`／`files`、`hashed`／`hashTotal`、`deleted`／`deleteTotal`、`elapsedMs`；掃描完成時附 `groups`、`groupCount`、`dupCount`） |
+| POST | `/api/dedup/pause` ｜ `/resume` ｜ `/cancel` | 暫停／繼續／中止重整工作（body: `{ id: jobId }`） |
 | POST | `/api/rename` | 更名（body: `{ path, newName }`，僅大小寫變更亦允許） |
 | POST | `/api/delete` | 刪除（body: `{ paths: [路徑…] }`） |
 | POST | `/api/zip` / GET `/api/zipfile` | 選取項目打包 ZIP 下載（資料夾遞迴） |
@@ -174,7 +178,7 @@ file-manager/
 | POST | `/api/backup` | 備份（body: `{ paths, dir }`；僅含封存標記 A 的檔案：無 .bak 時全備份 `f-時間.zip`，有 .bak 且歷程存在時以 sha256 比對做差異備份 `i-時間.zip`，無差異回傳 skip，備份後清除 A） |
 | GET | `/api/archive?path=…` | 壓縮檔內容預覽（獨立分頁 archive.html 使用） |
 | POST | `/api/restore` | 還原壓縮檔（body: `{ zip, destDir?, overwrite? }`） |
-| POST | `/api/dedup` | 重整掃描（body: `{ dir }`；找尋內容重複檔案，刪除動作沿用 `/api/delete`） |
+| POST | `/api/dedup` | 重整掃描（同步版，body: `{ dir }`；找尋內容重複檔案，刪除動作可用 `/api/dedup/delete/start` 或 `/api/delete`） |
 | POST | `/api/delete` | 刪除 |
 
 > 安全性備註：此工具僅綁定 `127.0.0.1`，為個人本機使用而設計，可存取執行帳號權限內的完整檔案系統。

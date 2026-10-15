@@ -102,7 +102,24 @@ const App = {
       treeErrors: {},           // path -> bool
       destModal: { show: false, mode: 'copy', src: null, srcs: null, srcName: '', dest: '', destOk: false, destInfo: false },
       renameModal: { show: false, path: '', oldName: '', newName: '', error: '' },
-      dedupModal: { show: false, loading: false, error: '', groups: [], groupCount: 0, dupCount: 0 },
+      dedupModal: {
+        show: false,
+        loading: false,          // 掃描進行中
+        deleting: false,         // 刪除進行中
+        jobId: '',               // 掃描工作 id
+        deleteJobId: '',         // 刪除工作 id
+        state: '',               // running | paused | done | cancelled | error
+        phase: '',               // walk | group | hash | delete | done
+        message: '',
+        current: '',
+        percent: null,           // 0～100 或 null（不確定進度）
+        elapsedMs: 0,
+        scanned: 0, dirs: 0, files: 0,
+        hashed: 0, hashTotal: 0, hashBytes: 0, hashTotalBytes: 0,
+        deleted: 0, deleteTotal: 0, freed: 0,
+        truncated: false,
+        error: '', groups: [], groupCount: 0, dupCount: 0,
+      },
       dedupSel: {},              // path -> true（重整：勾選要刪除的重複檔案）
       preview: { show: false, name: '', path: '', kind: '', content: '', rendered: '', info: '', loading: false, error: '' },
       toast: { show: false, msg: '', type: 'ok' },
@@ -171,6 +188,35 @@ const App = {
       let s = 0;
       for (const g of this.dedupModal.groups) for (const f of g.files) if (this.dedupSel[f.path]) s += f.size;
       return s;
+    },
+
+    /* 重整：處理中（顯示進度面板） */
+    dedupBusy() {
+      return this.dedupModal.loading || this.dedupModal.deleting;
+    },
+
+    dedupPhaseLabel() {
+      const m = this.dedupModal;
+      if (m.deleting) return '刪除重複檔案';
+      switch (m.phase) {
+        case 'walk': return '掃描資料夾與檔案';
+        case 'group': return '依檔案大小分組';
+        case 'hash': return '比對內容（sha256）';
+        case 'done': return '完成';
+        default: return '準備中';
+      }
+    },
+
+    dedupProgressText() {
+      const m = this.dedupModal;
+      if (m.deleting) {
+        return `已刪除 ${m.deleted} / ${m.deleteTotal} 個 ｜ 已釋放 ${this.fmtSize(m.freed)}`;
+      }
+      if (m.phase === 'hash' && m.hashTotal) {
+        return `已比對 ${m.hashed} / ${m.hashTotal} 個檔案 ｜ ${this.fmtSize(m.hashBytes)} / ${this.fmtSize(m.hashTotalBytes)}`;
+      }
+      if (m.phase === 'group') return `已掃描 ${m.dirs} 個資料夾、${m.files} 個檔案`;
+      return `已掃描 ${m.dirs} 個資料夾、${m.files} 個檔案（${m.scanned} 個項目）`;
     },
   },
 
@@ -389,36 +435,224 @@ const App = {
       }
     },
 
-    /* ---- 重整：找尋與刪除內容重複的檔案 ---- */
+    /* ---- 重整：找尋與刪除內容重複的檔案（含進度、暫停、繼續、中止） ---- */
+    resetDedupProgress() {
+      const m = this.dedupModal;
+      m.state = 'running';
+      m.phase = 'init';
+      m.message = '準備中…';
+      m.current = '';
+      m.percent = null;
+      m.elapsedMs = 0;
+      m.scanned = 0; m.dirs = 0; m.files = 0;
+      m.hashed = 0; m.hashTotal = 0; m.hashBytes = 0; m.hashTotalBytes = 0;
+      m.deleted = 0; m.deleteTotal = 0; m.freed = 0;
+      m.truncated = false;
+    },
+
     async openDedup() {
       if (!this.selectedDir) return;
-      this.dedupModal.show = true;
-      this.dedupModal.loading = true;
-      this.dedupModal.error = '';
+      const m = this.dedupModal;
+      clearTimeout(this._dedupTimer);
+      clearTimeout(this._dedupDelTimer);
+      m.show = true;
+      m.loading = true;
+      m.deleting = false;
+      m.error = '';
+      m.groups = [];
+      m.groupCount = 0;
+      m.dupCount = 0;
+      m.jobId = '';
+      m.deleteJobId = '';
+      this.resetDedupProgress();
       this.dedupSel = {};
       try {
-        const d = await this.api('/api/dedup', {
+        const d = await this.api('/api/dedup/start', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ dir: this.selectedDir.path }),
         });
-        this.dedupModal.groups = d.groups || [];
-        this.dedupModal.groupCount = d.groupCount || 0;
-        this.dedupModal.dupCount = d.dupCount || 0;
-        this.dedupSel = this.defaultDedupSel();
+        m.jobId = d.jobId;
+        this.pollDedupStatus();
       } catch (e) {
-        this.dedupModal.error = e.message;
-        this.dedupModal.groups = [];
-        this.dedupModal.groupCount = 0;
-        this.dedupModal.dupCount = 0;
-      } finally {
-        this.dedupModal.loading = false;
+        m.error = e.message;
+        m.loading = false;
       }
     },
 
-    closeDedup() {
-      this.dedupModal.show = false;
-      this.dedupModal.groups = [];
+    /** 套用掃描工作狀態快照 */
+    applyScanStatus(s) {
+      const m = this.dedupModal;
+      m.state = s.state;
+      m.phase = s.phase;
+      m.message = s.message || '';
+      m.current = s.current || '';
+      m.percent = s.percent;
+      m.elapsedMs = s.elapsedMs || 0;
+      m.scanned = s.scanned || 0;
+      m.dirs = s.dirs || 0;
+      m.files = s.files || 0;
+      m.hashed = s.hashed || 0;
+      m.hashTotal = s.hashTotal || 0;
+      m.hashBytes = s.hashBytes || 0;
+      m.hashTotalBytes = s.hashTotalBytes || 0;
+      m.truncated = !!s.truncated;
+    },
+
+    pollDedupStatus() {
+      clearTimeout(this._dedupTimer);
+      const m = this.dedupModal;
+      if (!m.jobId) return;
+      const tick = async () => {
+        if (!m.show || !m.loading) return;
+        try {
+          const s = await this.api('/api/dedup/status?id=' + encodeURIComponent(m.jobId));
+          this.applyScanStatus(s);
+          if (s.state === 'done') {
+            m.groups = s.groups || [];
+            m.groupCount = s.groupCount || 0;
+            m.dupCount = s.dupCount || 0;
+            m.loading = false;
+            this.dedupSel = this.defaultDedupSel();
+            return;
+          }
+          if (s.state === 'cancelled') {
+            m.loading = false;
+            this.showToast('掃描已中止', 'warn');
+            return;
+          }
+          if (s.state === 'error') {
+            m.loading = false;
+            m.error = s.error || '掃描失敗';
+            return;
+          }
+          this._dedupTimer = setTimeout(tick, 400);
+        } catch (e) {
+          m.loading = false;
+          m.error = e.message;
+        }
+      };
+      tick();
+    },
+
+    /** 套用刪除工作狀態快照 */
+    applyDeleteStatus(s) {
+      const m = this.dedupModal;
+      m.state = s.state;
+      m.phase = s.phase;
+      m.message = s.message || '';
+      m.current = s.current || '';
+      m.percent = s.percent;
+      m.elapsedMs = s.elapsedMs || 0;
+      m.deleted = s.deleted || 0;
+      m.deleteTotal = s.deleteTotal || 0;
+      m.freed = s.freed || 0;
+    },
+
+    pollDedupDelete() {
+      clearTimeout(this._dedupDelTimer);
+      const m = this.dedupModal;
+      if (!m.deleteJobId) return;
+      const tick = async () => {
+        if (!m.show || !m.deleting) return;
+        try {
+          const s = await this.api('/api/dedup/status?id=' + encodeURIComponent(m.deleteJobId));
+          this.applyDeleteStatus(s);
+          if (s.state === 'done') {
+            m.deleting = false;
+            this.showToast(`已刪除 ${s.deleted} 個重複檔案（釋放 ${this.fmtSize(s.freed)}）`);
+            this.closeDedupNow();
+            await this.loadFiles();
+            return;
+          }
+          if (s.state === 'cancelled') {
+            m.deleting = false;
+            this.showToast('刪除已中止', 'warn');
+            this.closeDedupNow();
+            await this.loadFiles();
+            return;
+          }
+          if (s.state === 'error') {
+            m.deleting = false;
+            m.error = s.error || '刪除失敗';
+            return;
+          }
+          this._dedupDelTimer = setTimeout(tick, 250);
+        } catch (e) {
+          m.deleting = false;
+          m.error = e.message;
+        }
+      };
+      tick();
+    },
+
+    /** 暫停目前工作（掃描或刪除） */
+    async dedupPause() {
+      const m = this.dedupModal;
+      await this.dedupControl('pause', m.deleting ? m.deleteJobId : m.jobId, m.deleting);
+    },
+
+    /** 繼續目前工作 */
+    async dedupResume() {
+      const m = this.dedupModal;
+      await this.dedupControl('resume', m.deleting ? m.deleteJobId : m.jobId, m.deleting);
+    },
+
+    /** 中止目前工作 */
+    async dedupCancel() {
+      const m = this.dedupModal;
+      if (m.deleting) await this.dedupControl('cancel', m.deleteJobId, true);
+      else if (m.loading) await this.dedupControl('cancel', m.jobId, false);
+    },
+
+    async dedupControl(action, jobId, isDelete) {
+      if (!jobId) return;
+      try {
+        const s = await this.api('/api/dedup/' + action, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: jobId }),
+        });
+        if (isDelete) this.applyDeleteStatus(s);
+        else this.applyScanStatus(s);
+        if (action === 'resume') {
+          if (isDelete) this.pollDedupDelete();
+          else this.pollDedupStatus();
+        }
+      } catch (e) {
+        this.showToast('操作失敗：' + e.message, 'err');
+      }
+    },
+
+    cancelJob(id) {
+      if (!id) return;
+      this.api('/api/dedup/cancel', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      }).catch(() => { /* 工作可能已結束，忽略 */ });
+    },
+
+    /** 直接關閉重整彈窗（不詢問、不中止工作，供刪除結束後呼叫） */
+    closeDedupNow() {
+      clearTimeout(this._dedupTimer);
+      clearTimeout(this._dedupDelTimer);
+      const m = this.dedupModal;
+      m.show = false;
+      m.loading = false;
+      m.deleting = false;
+      m.groups = [];
       this.dedupSel = {};
+    },
+
+    closeDedup() {
+      const m = this.dedupModal;
+      if (m.deleting) {
+        if (!confirm('刪除仍在進行中，確定要中止嗎？（已刪除的檔案不會復原）')) return;
+        this.cancelJob(m.deleteJobId);
+        this.closeDedupNow();
+        this.loadFiles();
+        return;
+      }
+      if (m.loading) this.cancelJob(m.jobId);
+      this.closeDedupNow();
     },
 
     defaultDedupSel() {
@@ -438,21 +672,34 @@ const App = {
     async confirmDedup() {
       const paths = Object.keys(this.dedupSel);
       if (!paths.length) { this.showToast('未勾選任何檔案', 'warn'); return; }
+      const m = this.dedupModal;
       // 警告：若某組重複檔案被全部勾選（不留任何副本）
-      const wiped = this.dedupModal.groups.filter((g) => g.files.every((f) => this.dedupSel[f.path])).length;
+      const wiped = m.groups.filter((g) => g.files.every((f) => this.dedupSel[f.path])).length;
       let msg = `確定刪除勾選的 ${paths.length} 個重複檔案（釋放 ${this.fmtSize(this.dedupFreedSize)}）嗎？此操作無法復原。`;
       if (wiped) msg = `⚠ ${wiped} 組重複檔案將被全部刪除（不留任何副本）！\n` + msg;
       if (!confirm(msg)) return;
+      m.deleting = true;
+      m.error = '';
+      m.state = 'running';
+      m.phase = 'delete';
+      m.message = '準備刪除…';
+      m.current = '';
+      m.percent = null;
+      m.elapsedMs = 0;
+      m.deleted = 0;
+      m.deleteTotal = paths.length;
+      m.freed = 0;
+      m.deleteJobId = '';
       try {
-        const d = await this.api('/api/delete', {
+        const d = await this.api('/api/dedup/delete/start', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ paths }),
         });
-        this.showToast(`已刪除 ${d.deleted} 個重複檔案（釋放 ${this.fmtSize(this.dedupFreedSize)}）`);
-        this.closeDedup();
-        await this.loadFiles();
+        m.deleteJobId = d.jobId;
+        this.pollDedupDelete();
       } catch (e) {
-        this.showToast('刪除失敗：' + e.message, 'err');
+        m.deleting = false;
+        m.error = e.message;
       }
     },
 
@@ -825,12 +1072,27 @@ const App = {
       const pad = (n) => String(n).padStart(2, '0');
       return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     },
+
+    fmtDuration(ms) {
+      const s = Math.floor((ms || 0) / 1000);
+      if (s < 60) return `${s} 秒`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m} 分 ${s % 60} 秒`;
+      return `${Math.floor(m / 60)} 時 ${m % 60} 分`;
+    },
   },
 
   mounted() {
     this.loadRoots();
     this.loadFavorites();
     this.api('/api/meta').then((m) => { this.meta = m; }).catch(() => {});
+  },
+
+  beforeUnmount() {
+    clearTimeout(this._dedupTimer);
+    clearTimeout(this._dedupDelTimer);
+    if (this.dedupModal.loading) this.cancelJob(this.dedupModal.jobId);
+    if (this.dedupModal.deleting) this.cancelJob(this.dedupModal.deleteJobId);
   },
 
   template: TEMPLATES.root,

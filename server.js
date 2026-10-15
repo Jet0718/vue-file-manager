@@ -859,51 +859,211 @@ function defaultRestoreDir(zipPath) {
 /* ---------------- 重整：找尋內容重複的檔案（去重） ---------------- */
 
 const DEDUP_MAX_SCAN = 50000; // 掃描節點上限，避免大型目錄卡死
+const DEDUP_JOB_TTL = 10 * 60 * 1000; // 工作結束後保留 10 分鐘供前端查詢結果
+const DEDUP_JOBS = new Map(); // id -> Job
+let dedupJobSeq = 0;
+
+class TaskCancelled extends Error {
+  constructor() { super('已中止'); this.cancelled = true; }
+}
+
+/**
+ * 可暫停／繼續／中止的背景工作。
+ * 長時間迴圈中呼叫 checkpoint()：暫停時在此等待，中止時丟出 TaskCancelled。
+ */
+class Job {
+  constructor(type, dir) {
+    this.id = `j${Date.now().toString(36)}-${(++dedupJobSeq).toString(36)}`;
+    this.type = type;               // 'scan' | 'delete'
+    this.dir = dir || '';
+    this.state = 'running';         // running | paused | done | cancelled | error
+    this.phase = 'init';            // init | walk | group | hash | delete | done
+    this.message = '準備中…';
+    this.current = '';
+    this.startedAt = Date.now();
+    this.finishedAt = 0;
+    // 掃描統計
+    this.scanned = 0; this.dirs = 0; this.files = 0;
+    this.hashed = 0; this.hashTotal = 0; this.hashBytes = 0; this.hashTotalBytes = 0;
+    // 刪除統計
+    this.deleted = 0; this.deleteTotal = 0; this.freed = 0;
+    // 結果
+    this.groups = null; this.groupCount = 0; this.dupCount = 0;
+    this.truncated = false;
+    this.error = '';
+    this._waiters = [];
+  }
+
+  pause() {
+    if (this.state === 'running') { this.state = 'paused'; this.message = '已暫停'; }
+    return this;
+  }
+
+  resume() {
+    if (this.state === 'paused') { this.state = 'running'; this.message = '繼續中…'; this._wake(); }
+    return this;
+  }
+
+  cancel() {
+    if (this.state === 'running' || this.state === 'paused') {
+      this.state = 'cancelled';
+      this.message = '正在中止…';
+      this._wake();
+    }
+    return this;
+  }
+
+  _wake() {
+    const ws = this._waiters;
+    this._waiters = [];
+    for (const r of ws) r();
+  }
+
+  async checkpoint() {
+    while (this.state === 'paused') await new Promise((r) => this._waiters.push(r));
+    if (this.state === 'cancelled') throw new TaskCancelled();
+  }
+
+  /** 進度百分比（0～100）；無法估算時回傳 null（前端顯示為不確定進度） */
+  percent() {
+    if (this.state === 'done') return 100;
+    if (this.type === 'delete') {
+      return this.deleteTotal > 0 ? Math.round((this.deleted / this.deleteTotal) * 100) : null;
+    }
+    if (this.phase === 'hash' && this.hashTotalBytes > 0) {
+      return Math.min(99, Math.round((this.hashBytes / this.hashTotalBytes) * 100));
+    }
+    return null;
+  }
+
+  snapshot() {
+    return {
+      id: this.id,
+      type: this.type,
+      dir: this.dir,
+      state: this.state,
+      phase: this.phase,
+      message: this.message,
+      current: this.current,
+      percent: this.percent(),
+      elapsedMs: (this.finishedAt || Date.now()) - this.startedAt,
+      scanned: this.scanned, dirs: this.dirs, files: this.files,
+      hashed: this.hashed, hashTotal: this.hashTotal,
+      hashBytes: this.hashBytes, hashTotalBytes: this.hashTotalBytes,
+      deleted: this.deleted, deleteTotal: this.deleteTotal, freed: this.freed,
+      groupCount: this.groupCount, dupCount: this.dupCount,
+      groups: this.groups, truncated: this.truncated,
+      error: this.error,
+    };
+  }
+
+  finish(message) {
+    this.state = 'done';
+    this.phase = 'done';
+    if (message) this.message = message;
+    this.finishedAt = Date.now();
+    this._expire();
+  }
+
+  fail(e) {
+    if (e && e.cancelled) {
+      this.state = 'cancelled';
+      this.message = '已中止';
+    } else {
+      this.state = 'error';
+      this.message = '發生錯誤';
+      this.error = (e && e.message) || '未知錯誤';
+    }
+    this.finishedAt = Date.now();
+    this._expire();
+  }
+
+  _expire() {
+    const t = setTimeout(() => DEDUP_JOBS.delete(this.id), DEDUP_JOB_TTL);
+    if (t.unref) t.unref();
+  }
+}
+
+function newDedupJob(type, dir) {
+  const job = new Job(type, dir);
+  DEDUP_JOBS.set(job.id, job);
+  return job;
+}
 
 /**
  * 掃描目前資料夾與子目錄，找出內容相同的重複檔案。
  * 先依檔案長度（大小）分組，僅對同大小檔案再比對 sha256 內容雜湊。
  * 每組預設勾選「檔名較長者」：保留檔名最短的檔案，其餘標記 defaultChecked。
+ * 過程中可透過 job 暫停／繼續／中止。
  */
-async function scanDuplicates(rootDir) {
+async function runScanJob(job) {
+  const rootDir = job.dir;
   const files = []; // { path, name, size, mtime }
-  let scanned = 0;
+  job.phase = 'walk';
+  job.message = '掃描資料夾…';
+
   const visit = async (abs) => {
-    if (scanned >= DEDUP_MAX_SCAN) return;
+    await job.checkpoint();
+    if (job.scanned >= DEDUP_MAX_SCAN) { job.truncated = true; return; }
     let entries;
     try { entries = await fsp.readdir(abs, { withFileTypes: true }); } catch { return; }
-    scanned += entries.length;
+    job.dirs++;
+    job.scanned += entries.length;
     for (const e of entries) {
-      if (scanned >= DEDUP_MAX_SCAN) return;
+      await job.checkpoint();
       if (e.name.startsWith('.')) continue;             // 略過隱藏檔／.bak／歷程文件
+      const full = path.join(abs, e.name);
       if (e.isDirectory()) {
         if (RECENT_SKIP.has(e.name)) continue;          // 略過 node_modules 等雜訊目錄
-        await visit(path.join(abs, e.name));
+        await visit(full);
       } else {
-        const full = path.join(abs, e.name);
         let st;
         try { st = await fsp.stat(full); } catch { continue; }
         files.push({ path: full, name: e.name, size: st.size, mtime: st.mtimeMs });
+        job.files = files.length;
+        job.current = full;
       }
     }
   };
   await visit(rootDir);
 
   // 第一步：依檔案長度（大小）分組，只保留大小重複的
+  job.phase = 'group';
+  job.message = '依檔案大小分組…';
+  job.current = '';
+  await job.checkpoint();
   const bySize = new Map();
   for (const f of files) {
     if (!bySize.has(f.size)) bySize.set(f.size, []);
     bySize.get(f.size).push(f);
   }
 
-  // 第二步：同大小的檔案再比對 sha256 內容雜湊
+  // 第二步：同大小的檔案再比對 sha256 內容雜湊（逐檔檢查暫停／中止）
+  const candidates = [];
+  let hashTotalBytes = 0;
+  for (const list of bySize.values()) {
+    if (list.length < 2) continue;
+    for (const f of list) { candidates.push(f); hashTotalBytes += f.size; }
+  }
+  job.phase = 'hash';
+  job.hashTotal = candidates.length;
+  job.hashTotalBytes = hashTotalBytes;
+  job.message = candidates.length
+    ? `比對 ${candidates.length} 個同大小檔案的內容…`
+    : '沒有同大小的檔案，無需比對內容';
+
   const groups = [];
   for (const [size, list] of bySize) {
     if (list.length < 2) continue;
     const byHash = new Map();
     for (const f of list) {
-      let h;
-      try { h = await sha256File(f.path); } catch { continue; }
+      job.current = f.path;
+      await job.checkpoint();
+      let h = null;
+      try { h = await sha256File(f.path); } catch { /* 讀取失敗則略過 */ }
+      job.hashed++;
+      job.hashBytes += f.size;
+      if (!h) continue;
       if (!byHash.has(h)) byHash.set(h, []);
       byHash.get(h).push(f);
     }
@@ -926,7 +1086,35 @@ async function scanDuplicates(rootDir) {
     }
   }
   groups.sort((a, b) => b.size - a.size); // 大檔案優先呈現
-  return groups;
+  job.groups = groups;
+  job.groupCount = groups.length;
+  job.dupCount = groups.reduce((s, g) => s + g.files.length, 0);
+  job.current = '';
+  job.finish(groups.length
+    ? `找到 ${groups.length} 組重複（共 ${job.dupCount} 個檔案）`
+    : '沒有內容相同的重複檔案');
+}
+
+/** 刪除勾選的重複檔案（逐檔檢查暫停／中止；失敗的檔案會略過） */
+async function runDeleteJob(job, paths) {
+  job.phase = 'delete';
+  job.deleteTotal = paths.length;
+  job.message = `刪除 ${paths.length} 個重複檔案…`;
+  for (const p of paths) {
+    job.current = p;
+    await job.checkpoint();
+    let full;
+    try { full = resolvePath(p); } catch { continue; }
+    let size = 0;
+    try { size = (await fsp.stat(full)).size; } catch { /* 已不存在 */ }
+    try {
+      await fsp.rm(full, { recursive: true, force: true });
+      job.deleted++;
+      job.freed += size;
+    } catch { /* 刪除失敗則略過 */ }
+  }
+  job.current = '';
+  job.finish(`已刪除 ${job.deleted} 個重複檔案`);
 }
 
 /** 遞迴複製資料夾 */
@@ -1331,6 +1519,13 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          case '/api/dedup/status': {
+            // 查詢重整工作進度（掃描／刪除）
+            const job = DEDUP_JOBS.get(q.get('id') || '');
+            if (!job) return sendJson(res, 404, { error: '工作不存在或已逾時' });
+            return sendJson(res, 200, { ok: true, ...job.snapshot() });
+          }
+
           default:
             return sendJson(res, 404, { error: '未知 API' });
         }
@@ -1532,15 +1727,59 @@ const server = http.createServer(async (req, res) => {
 
           case '/api/dedup': {
             // 重整：掃描目前資料夾與子目錄，列出內容相同的重複檔案（先比長度再比 sha256）
+            // 同步版本（相容舊介面）；需要進度／暫停／中止請改用 /api/dedup/start + /api/dedup/status
             let dir;
             try { dir = resolvePath(body.dir || ''); }
             catch { return sendJson(res, 400, { error: '缺少資料夾' }); }
             if (!isDir(dir)) return sendJson(res, 400, { error: '資料夾無效' });
-            let groups;
-            try { groups = await scanDuplicates(dir); }
-            catch (e) { return sendJson(res, 500, { error: `掃描失敗：${e.message}` }); }
-            const dupCount = groups.reduce((s, g) => s + g.files.length, 0);
-            return sendJson(res, 200, { ok: true, dir, groups, groupCount: groups.length, dupCount });
+            const job = newDedupJob('scan', dir);
+            try { await runScanJob(job); }
+            catch (e) {
+              job.fail(e);
+              return sendJson(res, 500, { error: `掃描失敗：${e.message}` });
+            }
+            return sendJson(res, 200, {
+              ok: true,
+              dir,
+              groups: job.groups || [],
+              groupCount: job.groupCount,
+              dupCount: job.dupCount,
+              truncated: job.truncated,
+              jobId: job.id,
+            });
+          }
+
+          case '/api/dedup/start': {
+            // 重整：建立背景掃描工作，回傳 jobId，前端輪詢 /api/dedup/status 取得進度
+            let dir;
+            try { dir = resolvePath(body.dir || ''); }
+            catch { return sendJson(res, 400, { error: '缺少資料夾' }); }
+            if (!isDir(dir)) return sendJson(res, 400, { error: '資料夾無效' });
+            const job = newDedupJob('scan', dir);
+            setImmediate(() => { runScanJob(job).catch((e) => job.fail(e)); });
+            return sendJson(res, 200, { ok: true, jobId: job.id, dir });
+          }
+
+          case '/api/dedup/delete/start': {
+            // 重整：建立背景刪除工作（可暫停／繼續／中止）
+            const paths = Array.isArray(body.paths) ? body.paths : (body.path ? [body.path] : []);
+            if (!paths.length) return sendJson(res, 400, { error: '缺少路徑' });
+            const job = newDedupJob('delete', '');
+            setImmediate(() => { runDeleteJob(job, paths).catch((e) => job.fail(e)); });
+            return sendJson(res, 200, { ok: true, jobId: job.id, total: paths.length });
+          }
+
+          case '/api/dedup/pause':
+          case '/api/dedup/resume':
+          case '/api/dedup/cancel': {
+            // 重整：暫停／繼續／中止背景工作
+            const job = DEDUP_JOBS.get(body.id || '');
+            if (!job) return sendJson(res, 404, { error: '工作不存在或已逾時' });
+            const action = pathname.slice(pathname.lastIndexOf('/') + 1);
+            if (action === 'pause') job.pause();
+            else if (action === 'resume') job.resume();
+            else job.cancel();
+            return sendJson(res, 200, { ok: true, ...job.snapshot() });
           }
 
           case '/api/rename': {
